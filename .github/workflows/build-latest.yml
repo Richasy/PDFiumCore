@@ -1,0 +1,105 @@
+name: Build Latest PDFium
+
+on:
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      pdfium_release:
+        description: 'PDFium release (use "latest" for newest version, or GitHub release ID)'
+        required: false
+        default: 'latest'
+      regenerate_bindings:
+        description: 'Regenerate C# bindings from headers'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+  # 每周一自动检查更新 (与 pdfium-binaries 同步)
+  schedule:
+    - cron: '0 12 * * 1'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.*
+
+    - name: Build Bindings Generator
+      run: dotnet build src/PDFiumCoreBindingsGenerator/PDFiumCoreBindingsGenerator.csproj -c Release
+
+    - name: Download PDFium & Generate Bindings
+      run: |
+        RELEASE="${{ github.event.inputs.pdfium_release || 'latest' }}"
+        REGEN="${{ github.event.inputs.regenerate_bindings || 'true' }}"
+        echo "PDFium Release: $RELEASE"
+        echo "Regenerate Bindings: $REGEN"
+        dotnet ./src/PDFiumCoreBindingsGenerator/bin/Release/net8.0/PDFiumCoreBindingsGenerator.dll "$RELEASE" "$REGEN"
+
+    - name: Read Version
+      id: version
+      run: |
+        VERSION=$(grep -oP '(?<=<Version>)[^<]+' src/Directory.Build.props)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+        echo "Built version: $VERSION"
+
+    - name: Build PDFiumCore
+      run: dotnet build src/PDFiumCore -c Release
+
+    - name: Pack
+      run: dotnet pack src/PDFiumCore -c Release -o ./artifacts
+
+    - name: Unit Tests
+      run: dotnet test src/PDFiumCore.Tests -c Release
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: PDFiumCore-${{ steps.version.outputs.version }}
+        path: |
+          artifacts/*.nupkg
+          artifacts/*.snupkg
+
+    - name: Check if tag exists
+      id: check_tag
+      run: |
+        if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create Release
+      if: steps.check_tag.outputs.exists == 'false'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.version.outputs.tag }}
+        name: "PDFiumCore ${{ steps.version.outputs.tag }}"
+        body: |
+          ## PDFiumCore ${{ steps.version.outputs.version }}
+
+          Auto-generated build with latest PDFium binaries from [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries).
+
+          ### Installation (Local NuGet)
+          Download the `.nupkg` file and add to your local NuGet source:
+          ```
+          dotnet nuget add source ./path/to/packages -n LocalPackages
+          dotnet add package PDFiumCore --version ${{ steps.version.outputs.version }}
+          ```
+        files: |
+          artifacts/*.nupkg
+          artifacts/*.snupkg
+        draft: false
+        prerelease: false
